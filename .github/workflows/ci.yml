@@ -1,0 +1,229 @@
+# 共通 CI（reusable workflow）
+# 各リポジトリから `uses: haruto-kamijo/ci-workflows/.github/workflows/ci.yml@main` で呼び出す。
+#
+# 1. detect: リポジトリの構成（package.json / pyproject.toml など）と、変更されたファイルの種類を判定
+# 2. 判定結果に応じて web / python / docs / workflows の各ジョブだけを実行
+#    （条件に合わずスキップされたジョブは、必須チェックとしては合格扱いになる）
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: ".nvmrc / .node-version が無い場合に使う Node.js のバージョン"
+        type: string
+        default: "20"
+      python-version:
+        description: ".python-version が無い場合に使う Python のバージョン"
+        type: string
+        default: "3.12"
+      run-build:
+        description: "Web プロジェクトで build スクリプトを実行するか（ビルドに秘密の環境変数が要る場合は false）"
+        type: boolean
+        default: true
+      run-all:
+        description: "変更ファイルに関係なく、構成上あり得るジョブをすべて実行する"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      web-dirs: ${{ steps.kind.outputs.web-dirs }}
+      python-dirs: ${{ steps.kind.outputs.python-dirs }}
+      web: ${{ inputs.run-all || steps.changes.outputs.web == 'true' }}
+      python: ${{ inputs.run-all || steps.changes.outputs.python == 'true' }}
+      docs: ${{ inputs.run-all || steps.changes.outputs.docs == 'true' }}
+      workflows: ${{ inputs.run-all || steps.changes.outputs.workflows == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # サブフォルダ（例: portfolio/）にあるプロジェクトも拾うため、深さ 3 まで探す
+      - id: kind
+        name: Detect project types
+        run: |
+          set -f  # -path のパターンがシェルに展開されないようにする
+          to_json() { python3 -c 'import json,sys; print(json.dumps([l for l in sys.stdin.read().split() if l]))'; }
+          prune='-path */node_modules -prune -o -path */.venv -prune -o -path */.git -prune -o'
+          web=$(find . -maxdepth 3 $prune -name package.json -print | xargs -r -n1 dirname | sort -u | to_json)
+          py=$(find . -maxdepth 3 $prune \( -name pyproject.toml -o -name requirements.txt -o -name setup.py \) -print | xargs -r -n1 dirname | sort -u | to_json)
+          echo "web-dirs=$web" >> "$GITHUB_OUTPUT"
+          echo "python-dirs=$py" >> "$GITHUB_OUTPUT"
+          echo "web: $web / python: $py"
+
+      - id: changes
+        name: Detect changed file types
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            web:
+              - '**/*.{js,jsx,mjs,cjs,ts,tsx,css,scss,vue,svelte,astro}'
+              - '**/package.json'
+              - '**/package-lock.json'
+              - '**/pnpm-lock.yaml'
+              - '**/yarn.lock'
+              - '**/tsconfig*.json'
+              - '**/.eslintrc*'
+              - '**/eslint.config.*'
+            python:
+              - '**/*.py'
+              - '**/pyproject.toml'
+              - '**/requirements*.txt'
+              - '**/uv.lock'
+              - '**/setup.py'
+              - '**/setup.cfg'
+            docs:
+              - '**/*.md'
+              - '**/*.mdx'
+            workflows:
+              - '.github/workflows/**'
+
+  web:
+    needs: detect
+    if: needs.detect.outputs.web == 'true' && needs.detect.outputs.web-dirs != '[]'
+    name: web (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.web-dirs) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pm
+        name: Detect package manager
+        run: |
+          if   [ -f pnpm-lock.yaml ]; then echo "pm=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f yarn.lock ];      then echo "pm=yarn" >> "$GITHUB_OUTPUT"
+          else                             echo "pm=npm"  >> "$GITHUB_OUTPUT"
+          fi
+          if   [ -f .nvmrc ];         then echo "version-file=${{ matrix.dir }}/.nvmrc" >> "$GITHUB_OUTPUT"
+          elif [ -f .node-version ];  then echo "version-file=${{ matrix.dir }}/.node-version" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.pm.outputs.pm != 'npm'
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.pm.outputs.version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ steps.pm.outputs.version-file }}
+
+      - name: Install
+        run: |
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --immutable || yarn install --frozen-lockfile ;;
+            npm)  if [ -f package-lock.json ]; then npm ci; else npm install; fi ;;
+          esac
+
+      - name: Lint
+        run: ${{ steps.pm.outputs.pm }} run --if-present lint
+
+      - name: Type check
+        run: |
+          if [ -f tsconfig.json ]; then npx --no-install tsc --noEmit; else echo "tsconfig.json が無いのでスキップ"; fi
+
+      - name: Test
+        run: ${{ steps.pm.outputs.pm }} run --if-present test
+
+      - name: Build
+        if: inputs.run-build
+        run: ${{ steps.pm.outputs.pm }} run --if-present build
+
+  python:
+    needs: detect
+    if: needs.detect.outputs.python == 'true' && needs.detect.outputs.python-dirs != '[]'
+    name: python (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.detect.outputs.python-dirs) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python
+        run: |
+          if [ -f .python-version ]; then uv python install; else uv python install "${{ inputs.python-version }}"; fi
+
+      # ruff は設定ファイルが無くても既定ルールで動く。pyproject.toml / ruff.toml があればそれに従う
+      - name: Lint (ruff)
+        run: uvx ruff check --output-format=github .
+
+      - name: Format check (ruff)
+        run: uvx ruff format --check --diff .
+
+      - name: Test (pytest)
+        run: |
+          if ! ls tests test 2>/dev/null | grep -q . && ! ls test_*.py *_test.py 2>/dev/null | grep -q .; then
+            echo "テストが見つからないのでスキップ"; exit 0
+          fi
+          if [ -f uv.lock ]; then
+            uv sync --all-extras --dev
+            uv run --with pytest pytest
+          else
+            uv venv
+            if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
+            if [ -f pyproject.toml ] || [ -f setup.py ]; then uv pip install -e . || true; fi
+            uv pip install pytest
+            uv run pytest
+          fi
+
+  docs:
+    needs: detect
+    if: needs.detect.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # リポジトリに設定が無い場合は、日本語の文書で誤検出しやすいルールを外した既定設定を使う
+      - name: Default markdownlint config
+        run: |
+          if ! ls .markdownlint* >/dev/null 2>&1; then
+            cat > .markdownlint-cli2.jsonc <<'EOF'
+          {
+            "config": {
+              "default": true,
+              "MD013": false,
+              "MD033": false,
+              "MD041": false
+            },
+            "ignores": ["**/node_modules/**", "**/.venv/**", "**/CHANGELOG.md"]
+          }
+          EOF
+          fi
+
+      - name: Lint (markdownlint)
+        uses: DavidAnson/markdownlint-cli2-action@v19
+        with:
+          globs: |
+            **/*.md
+            **/*.mdx
+            !**/node_modules/**
+
+  workflows:
+    needs: detect
+    if: needs.detect.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint (actionlint)
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
