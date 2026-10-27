@@ -39,6 +39,6 @@ gh repo create <name> --private --template haruto-kamijo/repo-template --clone
 
 ## 注意
 
-- このリポジトリは非公開。Settings → Actions → General → Access で「自分のリポジトリからのアクセス」を許可している
+- このリポジトリは公開している。非公開のままだと、公開リポジトリ（PortfolioSite など）から呼び出せないため。秘密情報は置かないこと
 - 呼び出し側のジョブには `contents: read` と `pull-requests: read` の権限が必要
 - 中身を変えると、`@main` で呼び出している全リポジトリに即座に反映される
